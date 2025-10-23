@@ -4,11 +4,11 @@ Ce dépôt contient un modèle **NetLogo** simulant la dégradation et la régé
 
 ## Contenu
 
-- `Group3_ForestDegradation.nlogox — modèle NetLogo principal  
-- `model_builder_QGIS.model3` — modèle QGIS associé  
-- `foret.png` — données d’entrée teste : zones forestières  
-- `artificialise.png` — données d’entrée teste : zones artificialisées  
-- `Groupe3_DégradationForêt_ODD.pdf` — documentation ODD complète du modèle  
+- `Group3_ForestDegradation.nlogox - modèle NetLogo principal  
+- `model_builder_QGIS.model3` - modèle QGIS associé  
+- `foret.png` - données d’entrée teste : zones forestières  
+- `artificialise.png` - données d’entrée teste : zones artificialisées  
+- `Groupe3_DégradationForêt_ODD.pdf` - documentation ODD complète du modèle  
 
 ## Utilisation
 
@@ -18,7 +18,7 @@ Ce dépôt contient un modèle **NetLogo** simulant la dégradation et la régé
 
 ## Références
 
-Le modèle est décrit selon la méthodologie **ODD (Overview, Design, Details)** dans le fichier [`Groupe3_DégradationForêt_ODD.pdf`](./Groupe3_DégradationForêt_ODD.pdf).
+Le modèle est décrit selon la méthodologie **ODD (Overview, Design, Details)** dans le fichier `Groupe3_DégradationForêt_ODD.pdf`
 
 ## Auteur et licence
 
