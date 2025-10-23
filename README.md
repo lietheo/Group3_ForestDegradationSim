@@ -12,7 +12,7 @@ Ce dépôt contient un modèle **NetLogo** simulant la dégradation et la régé
 
 ## Utilisation
 
-1. Ouvrir `modele_foret_degradation.nlogo` dans **NetLogo (≥ 6.3)**  
+1. Ouvrir `modele_foret_degradation.nlogo` dans **NetLogo (> 6.3)**  
 2. Cliquer sur **Setup** puis **Go** pour lancer la simulation  
 3. Les résultats (évolution du pourcentage de forêt, surfaces, etc.) sont visibles dans l’interface
 
