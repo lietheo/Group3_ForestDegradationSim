@@ -1,0 +1,1605 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.0" snapToGrid="true">
+  <code><![CDATA[patches-own [foret? artificialise? zone-type cause-degradation foret-id]
+globals [nb-arbre-abimer-exploitation nb-arbre-abimer-maladie nb-arbre-abimer-feu nb-arbre-regeneration n-centre-maladie n-centre-feu nb_forets taille_med taille_max indice_fragmentation taille_min forest-debut artificialized-debut nb_forets_debut taille_med_debut variance-exploite variance-artif variance-regeneration]
+
+to setup
+  clear-all
+  resize-world 0 499 0 499 
+  set-patch-size 1.2
+  reset-ticks
+  setup-environment
+  calcul-surf
+  calculer-fragmentation
+  calcul-surf-limitation
+end
+
+to go
+  show-change 
+  if ticks >= 20 [ stop ]  ;; Arrêt automatique après 20 ans
+  tick
+  expansion-artificialisation
+  exploitation
+  disease
+  fire
+  regeneration
+  calcul-surf
+  calcul-indic
+  calculer-fragmentation
+  show-change 
+end
+
+to setup-environment
+  traiter-artificialise
+  traiter-foret
+  classifier-zones
+  voir-zones
+end
+
+to calculer-fragmentation
+  definir-groupes
+  calculer-indicateurs-frag
+end
+
+;; Importer et classifier la forêt
+to traiter-foret
+  import-pcolors "foret.png"
+  ask patches [
+    set foret? (pcolor > 0)
+  ]
+end
+
+;; Importer et classifier les zones artifisialisées (agricole + urbain)
+to traiter-artificialise
+  import-pcolors "artificialise.png"
+  ask patches [
+    set artificialise? (pcolor > 0)
+  ]
+end
+
+;; Fusion logique des deux couches
+to classifier-zones
+  ask patches [
+    if artificialise? [
+      set zone-type "artificialise"
+    ]
+    if (not artificialise?) and foret? [
+      set zone-type "foret"
+    ]
+    if (not artificialise?) and (not foret?) [
+      set zone-type "non-artificialise"
+    ]
+  ]
+end
+
+;; Visualisation unique
+to voir-zones
+  ask patches [
+    if zone-type = "artificialise" [ set pcolor grey - 2 ]
+    if zone-type = "foret" [ set pcolor green ]
+    if zone-type = "non-artificialise" [ set pcolor orange ]
+  ]
+end
+
+
+
+to exploitation
+  
+  ;; Calcule le nombre de patches forestiers à abîmer selon un pourcentage (exploitation-origin)
+  ;; Définit deux probabilités : (permet de limité les pixels brouillon)
+  ;;   100% si le patch est collé à une zone déjà abîmée
+  ;;   5% si le patch est isolé
+  ;; Répète l’action autant de fois que nécessaire
+  ;; À chaque tour :
+  ;;     Sélectionne un patch forestier intact aléatoire
+  ;;     Identifie ses 8 voisins immédiats
+  ;;     Vérifie s’il est collé à une forêt abîmée
+  ;;     Applique la probabilité correspondante (selon s’il est collé ou isolé). Permet de rendre moins "brouillon", tendance proche
+  ;;     Si la condition est remplie :
+  ;;        Convertit le patch en forêt abîmée
+  ;;        Attribue la cause “exploitation”
+  ;;        Change la couleur pour visualiser la dégradation
+
+  ;; Nombre total de patches d'exploitation avec le % de base liée à un coef pour prendre en compte le fait que la foret diminue et les prise de consience.
+  let coef-foret (count patches with [zone-type = "foret"] / forest-debut)
+  set variance-exploite coef-foret * exploitation-origin
+  set nb-arbre-abimer-exploitation round (coef-foret * (exploitation-origin / 100) * count patches with [zone-type = "foret"])
+  
+  ;; Probabilité d’abîmer un patch collé à une zone déjà abîmée (plus rentable et logique)
+  let proba-collé 1
+  ;; Probabilité d’abîmer un patch isolé
+  let proba-isole 0.05
+  
+  let compteur 0 ;; Compteur
+
+  ;; Répète jusqu’à atteindre le quota ou épuisement des patches forestiers
+  while [compteur < nb-arbre-abimer-exploitation and any? patches with [zone-type = "foret"]] [
+    let cible one-of patches with [zone-type = "foret"]  ;; Un patch forestier aléatoire encore intact
+    if cible != nobody [  ;; Vérifie qu'il en reste
+      let voisins [neighbors] of cible  ;; Récupère les 8 voisins immédiats du patch
+      let est-colle any? voisins with [zone-type = "foret-abimee" and cause-degradation = "exploitation"]  ;; Vérifie si au moins un voisin est déjà abîmé (avec une cause exploitation (logique))
+      
+      if (est-colle and random-float 1 < proba-collé) or  ;; Si collé, applique une probabilité haute de s'abîmer (100%)
+         (not est-colle and random-float 1 < proba-isole) [  ;; Si isolé, applique une probabilité faible de s'abîmer (5%)
+        ask cible [  ;; Si la condition est remplie
+          set zone-type "foret-abimee"
+          set pcolor lime + 3  ;; Change la couleur pour visualiser l'abîme
+          set cause-degradation "exploitation"
+        ]
+        set compteur compteur + 1
+      ]
+    ]
+  ]
+  
+end
+
+
+
+
+to disease
+  
+  ;; Vérifie que les paramètres de maladie sont actifs (disease-ray > 0 et max-number-disease > 0)
+  ;; Détermine aléatoirement le nombre de foyers de maladie entre un minimum et un maximum
+  ;; Identifie tous les patches forestiers disponibles (zone-type = "foret")
+  ;; Sélectionne aléatoirement les foyers initiaux parmi les patches forestiers
+  ;; Pour chaque foyer :
+  ;;         Calcule le rayon d’impact en nombre de patches (disease-ray / resolution)
+  ;;         Abîme le patch central (le foyer) et le marque comme dégradé par maladie
+  ;;         Sélectionne les patches voisins dans le rayon qui sont encore forestiers
+  ;;         Applique une probabilité de 50% pour que chaque voisin soit aussi abîmé par la maladie
+  ;;         La propagation est instantanée et locale
+  
+  if disease-ray > 0 and max-number-disease > 0[
+    ;; Nombre de foyers aléatoire entre min et max
+    set n-centre-maladie random (max-number-disease - min-number-disease + 1) + min-number-disease
+    
+    ;; Récupérer tous les patches de forêt
+    let foret-patches patches with [zone-type = "foret"]
+    
+    ;; Créer chaque foyer
+    ask n-of min list n-centre-maladie count foret-patches foret-patches [
+      set cause-degradation "maladie"
+      ;; Rayon en nombre de patches = rayon en mètres / taille d'un patch
+      let rayon max list 1 (disease-ray / resolution)
+      
+      ;; Abîmer le patch central
+      set zone-type "foret-abimee"
+      set pcolor lime + 3
+      
+      ;; Sélectionner patches voisins autour du foyer
+      let voisins-malades patches in-radius rayon with [zone-type = "foret"]
+      
+      ;; Rendre irrégulièrement les patches voisins abîmés
+      ask voisins-malades [
+        if random-float 1.0 < 0.5 [ ;; 50% de chance
+          set zone-type "foret-abimee"
+          set pcolor lime + 3
+          set cause-degradation "maladie"
+        ]
+      ]
+    ]
+    set nb-arbre-abimer-maladie count patches with [zone-type = "foret-abimee" and cause-degradation = "maladie"] ;; Nb patches malades
+  ]
+end
+
+to fire
+  
+  ;; Vérifie si des foyers de feu doivent être générés (max-number-fire > 0)
+  ;; Détermine aléatoirement le nombre de foyers initiaux entre un minimum et un maximum
+  ;; Identifie tous les patches forestiers disponibles (zone-type = "foret")
+  ;; Sélectionne aléatoirement les foyers initiaux parmi les patches forestiers
+  ;; Convertit ces foyers en forêt abîmée avec la cause "feu" et une couleur visuelle
+  ;; Initialise la propagation à partir des foyers du tick courant
+  ;; Tant qu’il reste des foyers actifs :
+  ;;        Pour chaque foyer, regarde les patches voisins dans un rayon de 1
+  ;;        Si le voisin est une forêt intacte, il a 50% de chance de brûler
+  ;;        Les nouveaux patches brûlés deviennent les foyers du tour suivant
+  ;;        La boucle continue jusqu’à ce qu’il n’y ait plus de propagation possible
+  
+  if max-number-fire > 0  [
+    ;; Nombre de foyers aléatoire
+    set n-centre-feu random (max-number-fire - min-number-fire + 1) + min-number-fire
+    
+    ;; Récupérer tous les patches de forêt
+    let foret-patches patches with [zone-type = "foret"]
+    
+    ;; Créer les foyers initiaux
+    let foyers n-of min list n-centre-feu count foret-patches foret-patches
+    ask foyers [
+      set cause-degradation "feu"
+      set zone-type "foret-abimee"
+      set pcolor lime + 3
+    ]
+    
+    ;; foyer = seulement les foyers du tick
+    let foyer patch-set foyers
+    
+    ;; Propagation en chaîne jusqu'à extinction
+    while [any? foyer] [ ;;Tant qu'il reste des patches
+      let nouveaux-foyer [] ;; Liste temporaire
+      ask foyer [
+        ask patches in-radius 1 with [zone-type = "foret"] [ ;; Regarde voisin radius de 1
+          if random-float 1.0 < 0.5 [ ;; 50% de chance que le voisin brule
+            set zone-type "foret-abimee"
+            set cause-degradation "feu"
+            set pcolor lime + 3
+            set nouveaux-foyer lput self nouveaux-foyer ;; Ajoute ce patch à la liste des nouveaux foyers (faire une chaine)
+          ]
+        ]
+      ]
+      set foyer patch-set nouveaux-foyer ;; Met à jour la liste des foyers avec les nouveaux patches
+    ]
+    set nb-arbre-abimer-feu count patches with [zone-type = "foret-abimee" and cause-degradation = "feu"]
+  ]
+end
+
+
+to expansion-artificialisation
+  
+  ;; Chaque année (tick), un pourcentage d’expansion est défini (expansion-origin)
+  ;; Le modèle calcule combien de nouveaux patches doivent être artificialisés
+  ;; Il sélectionne des patches voisins de zones déjà artificialisées
+  ;; Il les convertit en suivant l’ordre de priorité
+  ;; La conversion est spatiale et ciblée, pas aléatoire : elle dépend de la proximité
+  
+  ;; Nombre total de nouveaux patches à artificialise avec le % de base liée à un coef pour prendre en compte le fait que la foret diminue et les prise de consience. Et un bloquage des pouvoirs publiques si nécessaire
+  let coef-foret-artif (count patches with [zone-type = "foret"] / forest-debut)
+  set variance-artif coef-foret-artif * artificialization-extension-origin
+  if coef-foret-artif < (critical-forest-threshold / 100) [
+    set coef-foret-artif 0
+    set variance-artif 0]
+  
+  let nb-a-etendre round (coef-foret-artif * (artificialization-extension-origin / 100) * count patches with [zone-type != "artificialise"])
+  let compteur 0 ;; compteur
+  
+  ;; Ordre des types de zones à artificialiser (lien avec le cout)
+  let priorite-zones ["non-artificialise" "foret-abimee" "foret"]
+  
+  ;; Parcours des types de zones selon la priorité
+  foreach priorite-zones [ zone-cible ->
+    ;; Liste des patchs valides pour ce type
+    let artif-possible patches with [
+      zone-type = zone-cible and
+      any? neighbors with [zone-type = "artificialise"]
+    ]
+    
+    ;; Tant qu’il reste des artif-possible + quantité restant
+    while [compteur < nb-a-etendre and any? artif-possible] [
+      let cible one-of artif-possible
+      ask cible [
+        set zone-type "artificialise"
+        set pcolor grey - 2
+      ]
+      set compteur compteur + 1 ;; Rajout compteur
+      set artif-possible artif-possible with [self != cible]  ;; Retire le patch déjà utilisé
+    ]
+  ]
+end
+
+to regeneration
+
+  ;; Chaque année (tick), un pourcentage de régénération est défini (regeneration-colonisation-origin)
+  ;; Le modèle calcule combien de patches peuvent être régénérés, en fonction de la forêt intacte
+
+  if regeneration-colonisation-origin > 0 [
+
+    ;; Calcule le quota de régénération en fonction de la surface de forêt intacte
+    ;; Avec le % de base liée à un coef pour prendre en compte le fait que la foret se fragmente et diminue globalement de superficie (donc régénération plus difficile)
+    let coef-regen ((nb_forets / nb_forets_debut) ^ 0.2 * (taille_med / taille_med_debut) ^ 0.8) ^ 0.3;; limiter chute brutale. Et fragmentation impacte plus faible que la taille (taille = + de quantité de semences disponibles, fragmentation = favorise la pression anthropique mais moins d'impacte)
+    set variance-regeneration coef-regen * regeneration-colonisation-origin
+
+    set nb-arbre-regeneration round (coef-regen * (regeneration-colonisation-origin / 100) * count patches with [zone-type = "foret"])
+
+    ;; Compteur de patches régénérés
+    let total-regenerated 0
+
+    ;; Récupère tous les patches abîmés, sans distinction de cause
+    let abimes patches with [zone-type = "foret-abimee"]
+
+    ;; Détermine combien peuvent être régénérés
+    let n-to-regenerate min list nb-arbre-regeneration count abimes
+
+    ;; Régénère les patches abîmés
+    ask n-of n-to-regenerate abimes [
+      set zone-type "foret"   ;; Reclasse en forêt intacte
+      set cause-degradation ""   ;; Réinitialise la cause
+      set pcolor green ;; Met à jour la couleur
+    ]
+
+    ;; Met à jour le compteur
+    set total-regenerated n-to-regenerate
+
+    ;; Si le quota n’est pas entièrement utilisé : colonisation par voisin
+    let quota-restant nb-arbre-regeneration - total-regenerated
+    if quota-restant > 0 [
+
+      ;; Récupère les patches voisins de forêts existantes et non forestiers
+      let voisins-forets patches with [
+        zone-type != "foret" and any? neighbors with [zone-type = "foret"]
+      ]
+
+      ;; Si pas assez de voisins, ajoute les patches non artificialisés restants pour dispersion aléatoire
+      if count voisins-forets < quota-restant [
+        let colonisation-random patches with [zone-type = "non-artificialise"]
+        set voisins-forets (patch-set voisins-forets colonisation-random)
+      ]
+
+      ;; Colonisation en forêt des patches sélectionnés
+      ask n-of min list quota-restant count voisins-forets voisins-forets [
+        set zone-type "foret"
+        set cause-degradation ""
+        set pcolor green
+      ]
+    ]
+  ]
+end
+
+
+to calcul-surf
+  let patch-area-ha ((resolution * resolution) / 10000)
+  
+  ;; Surface nature
+  let forest-area-ha count patches with [zone-type = "foret"] * patch-area-ha
+  let degraded-forest-area-ha count patches with [zone-type = "foret-abimee"] * patch-area-ha
+  let non-artificialized-area-ha count patches with [zone-type = "non-artificialise"] * patch-area-ha
+  let artificialized-area-ha count patches with [zone-type = "artificialise"] * patch-area-ha
+
+  ;; Mise à jour du graphique
+  set-current-plot "Type of surface"
+
+  set-current-plot-pen "Forest"
+  plot forest-area-ha
+
+  set-current-plot-pen "Degraded-forest"
+  plot degraded-forest-area-ha
+
+  set-current-plot-pen "No-artificialized"
+  plot non-artificialized-area-ha
+
+  set-current-plot-pen "Artificialized"
+  plot artificialized-area-ha
+  
+end
+
+to calcul-surf-limitation
+  
+  ;; Pour les coef liés à l'exploitation/artificialisation/regeneration
+  set forest-debut count patches with [zone-type = "foret"]
+  set artificialized-debut count patches with [zone-type = "artificialise"]
+  
+  set nb_forets_debut nb_forets
+  set taille_med_debut taille_med
+end
+
+to calcul-indic
+  let patch-area-ha ((resolution * resolution) / 10000)
+  
+  ;; Surface processus
+  let exploitation-area-ha nb-arbre-abimer-exploitation * patch-area-ha
+  let maladie-forest-area-ha nb-arbre-abimer-maladie * patch-area-ha
+  let feu-area-ha nb-arbre-abimer-feu * patch-area-ha
+  let regeneration-area-ha nb-arbre-regeneration * patch-area-ha
+  
+    ;; Mise à jour du graphique
+  set-current-plot "Causes of deterioration and regeneration (excluding artificialisation)"
+
+  set-current-plot-pen "Exploitation"
+  plot exploitation-area-ha
+
+  set-current-plot-pen "Diseases/Pest"
+  plot maladie-forest-area-ha
+
+  set-current-plot-pen "Fire"
+  plot feu-area-ha
+  
+  set-current-plot-pen "Regeneration/Colonisation"
+  plot regeneration-area-ha
+  
+  ;; Les foyers
+  set-current-plot "Number of degradation hotspots"
+  
+  set-current-plot-pen "Diseases/Pest"
+  plot n-centre-maladie
+  
+  set-current-plot-pen "Fire"
+  plot n-centre-feu
+  
+   ;; Variance de %
+  set-current-plot "Variance"
+  
+  set-current-plot-pen "% of exploitation"
+  plot variance-exploite
+  
+  set-current-plot-pen "% of artificialization"
+  plot variance-artif
+  
+    set-current-plot-pen "% of regeneration/colonisation"
+  plot variance-regeneration
+  
+end
+
+
+
+to definir-groupes
+  
+  ;; On utilise la logique du feu : on part d’un patch de forêt, 
+  ;; on regarde autour (ses voisins), on ajoute les voisins non assignés à la liste,
+  ;; puis on fait pareil pour chaque patch de la liste jusqu’à ce qu’il n’y ait plus de patch à traiter. 
+  ;; Comme ça, tous les patches contigus se retrouvent avec le même ID.
+
+  ;;  Réinitialiser tous les patches : aucun patch n’a encore de groupe
+  ask patches [ set foret-id 0 ]  
+  
+  ;; Compteur qui donnera un ID unique à chaque forêt
+  let compteur 0
+  
+  ;; Tant qu’il reste des patches de forêt sans ID
+  while [any? patches with [zone-type = "foret" and foret-id = 0]] [
+    
+    ;; Choisir un patch de départ pour créer un nouveau cluster
+    let depart one-of patches with [zone-type = "foret" and foret-id = 0]
+    
+    ;;  Incrémenter l’ID pour le nouveau cluster
+    set compteur compteur + 1
+    
+     ;; Assigner l’ID au patch de départ
+    ask depart [ set foret-id compteur ]
+    
+    ;; Créer une liste pour gérer la propagation aux voisins (on va les rajouter dedans)
+    let list_a_explorer (list depart)
+    
+    ;; Boucle de propagation : tant qu’il y a des patches à traiter
+    while [not empty? list_a_explorer] [
+      ;; Prendre le premier patch de la liste
+      let courant first list_a_explorer
+      ;; Retirer ce patch de la liste pour ne pas le traiter plusieurs fois
+      set list_a_explorer but-first list_a_explorer
+      
+      ;; Regarder les voisins
+      ask courant [
+        ;; Trouver tous les voisins 8-connectés sans ID
+        let voisins neighbors with [zone-type = "foret" and foret-id = 0]
+        
+        ;;  Donner à ces voisins le même ID que le groupe
+        ask voisins [ set foret-id compteur ]
+        
+        ;;  Ajouter ces voisins à la liste pour continuer la propagation
+        set list_a_explorer sentence list_a_explorer voisins
+      ]
+    ]
+  ]
+end
+
+
+;; Procédure calcule plusieurs valeurs globales :
+;;  le nombre total de forêts (groupes)
+;;  la taille médiane des forêts (en nombre de patches)
+;;  la plus grande et la plus petite forêt
+;;  un indice simple de fragmentation
+
+to calculer-indicateurs-frag
+  let patch-area-ha ((resolution * resolution) / 10000)
+  ;; Récupérer tous les identifiants de forêts existants
+  let id remove-duplicates [foret-id] of patches with [foret-id > 0]
+
+  ;; Compter le nombre total de forêts
+  set nb_forets length id
+
+  ;; Calculer la taille (nombre de patches) de chaque forêt
+  let tailles []
+  foreach id [
+    i ->
+    let taille count patches with [foret-id = i]
+    set tailles lput taille tailles
+  ]
+
+  ;; Déterminer les valeurs statistiques
+  set taille_med median tailles * patch-area-ha
+  set taille_max max tailles * patch-area-ha
+  set taille_min min tailles * patch-area-ha
+
+  ;; Calculer un indice simple de fragmentation : plus il y a de forêts distinctes pour une même surface, plus le paysage est fragmenté.
+  let total_foret count patches with [zone-type = "foret"]
+  set indice_fragmentation nb_forets / total_foret
+  
+      ;; Mise à jour du graphique
+  set-current-plot "Forest Sizes"
+
+  set-current-plot-pen "Median"
+  plot taille_med
+
+  set-current-plot-pen "Max"
+  plot taille_max
+  
+  set-current-plot-pen "Min"
+  plot taille_min
+  
+  set-current-plot "Fragmentation index"
+  
+  set-current-plot-pen "indice_fragmentation"
+  plot indice_fragmentation
+  
+  set-current-plot "Number of forests"
+  
+  set-current-plot-pen "nb_forets"
+  plot nb_forets
+  
+end
+
+
+
+to show-change ;; Jolie bascule d'affichage entre mode simple et mode détails forêt
+  if display-mode = "simple" [
+    ask patches [ 
+      if zone-type = "foret" [ set pcolor green ]
+      if zone-type = "foret-abimee" [ set pcolor lime + 3 ]
+      if zone-type = "non-artificialise" [ set pcolor orange ]
+      if zone-type = "artificialise" [ set pcolor grey - 2 ]
+    ]
+  ]
+  
+  if display-mode = "more" [
+    ask patches [
+      if zone-type = "foret" [ set pcolor green ]
+      if zone-type = "non-artificialise" [ set pcolor black ]
+      if zone-type = "artificialise" [ set pcolor black ] 
+      if zone-type = "foret-abimee" [
+        if cause-degradation = "exploitation" [ set pcolor brown ]
+        if cause-degradation = "feu" [ set pcolor red ]
+        if cause-degradation = "maladie" [ set pcolor violet ]
+      ]
+    ]
+  ]
+end
+
+
+
+
+
+
+
+
+
+
+
+
+]]></code>
+  <widgets>
+    <view x="340" wrappingAllowedX="false" y="10" frameRate="30.0" minPycor="0" height="604" showTickCounter="true" patchSize="1.2" fontSize="10" wrappingAllowedY="false" width="604" tickCounterLabel="ticks" maxPycor="499" updateMode="0" maxPxcor="499" minPxcor="0"></view>
+    <input x="35" multiline="false" y="30" height="60" variable="resolution" type="number" width="120">20.0</input>
+    <note x="100" y="35" backgroundDark="0" fontSize="12" width="50" markdown="false" height="20" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">(meter)</note>
+    <input x="190" multiline="false" y="270" height="60" variable="max-number-disease" type="number" width="145">5.0</input>
+    <input x="35" multiline="false" y="270" height="60" variable="min-number-disease" type="number" width="155">0.0</input>
+    <input x="30" multiline="false" y="405" height="60" variable="min-number-fire" type="number" width="155">0.0</input>
+    <input x="185" multiline="false" y="405" height="60" variable="max-number-fire" type="number" width="150">1.0</input>
+    <note x="145" y="175" backgroundDark="-1" fontSize="12" width="95" markdown="true" height="18" textColorDark="-16777216" textColorLight="-1" backgroundLight="-50397184">**EXPLOITATION**</note>
+    <note x="55" y="470" backgroundDark="-1" fontSize="12" width="250" markdown="true" height="20" textColorDark="-16777216" textColorLight="-1" backgroundLight="-66987753">**REGENERATION / FOREST COLONISATION**</note>
+    <slider x="35" step="resolution" y="330" max="1000" width="300" display="disease-ray" height="50" min="0" direction="Horizontal" default="150.0" variable="disease-ray" units="m"></slider>
+    <note x="140" y="250" backgroundDark="-1" fontSize="12" width="105" markdown="true" height="18" textColorDark="-16777216" textColorLight="-1" backgroundLight="-50397184">**DISEASES / PEST**</note>
+    <note x="165" y="385" backgroundDark="-1" fontSize="12" width="35" markdown="true" height="18" textColorDark="-16777216" textColorLight="-1" backgroundLight="-50397184">**FIRE**</note>
+    <button x="180" y="40" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="55">setup</button>
+    <button x="250" y="40" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="55">go</button>
+    <slider x="35" step="0.01" y="120" max="25" width="300" display="artificialization-extension-origin" height="50" min="0" direction="Horizontal" default="2.0" variable="artificialization-extension-origin" units="% / year"></slider>
+    <slider x="35" step="0.01" y="195" max="25" width="300" display="exploitation-origin" height="50" min="0" direction="Horizontal" default="3.0" variable="exploitation-origin" units="% / year"></slider>
+    <slider x="30" step="0.01" y="490" max="25" width="305" display="regeneration-colonisation-origin" height="50" min="0" direction="Horizontal" default="4.0" variable="regeneration-colonisation-origin" units="% / year"></slider>
+    <slider x="30" step="1" y="545" max="100" width="305" display="critical-forest-threshold" height="50" min="0" direction="Horizontal" default="35.0" variable="critical-forest-threshold" units="%"></slider>
+    <plot x="955" autoPlotX="true" yMax="100.0" autoPlotY="true" yAxis="Area (ha)" y="80" xMin="0.0" height="175" legend="true" xMax="20.0" yMin="0.0" width="500" xAxis="Time (years)" display="Type of surface">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Forest" color="-10899396" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Degraded-forest" color="-8330359" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="No-artificialized" color="-955883" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Artificialized" color="-11053225" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+    </plot>
+    <plot x="955" autoPlotX="true" yMax="100.0" autoPlotY="true" yAxis="Area (ha)" y="260" xMin="0.0" height="175" legend="true" xMax="20.0" yMin="0.0" width="500" xAxis="Time (years)" display="Causes of deterioration and regeneration (excluding artificialisation)">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Exploitation" color="-6459832" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Diseases/Pest" color="-8630108" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Fire" color="-2674135" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Regeneration/Colonisation" color="-10899396" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+    </plot>
+    <button x="1065" y="10" height="60" disableUntilTicks="false" forever="false" kind="Observer" width="91">show-change</button>
+    <chooser x="955" y="10" height="60" variable="display-mode" current="0" width="105" display="display-mode">
+      <choice type="string" value="simple"></choice>
+      <choice type="string" value="more"></choice>
+    </chooser>
+    <plot x="670" autoPlotX="false" yMax="0.0" autoPlotY="true" y="620" xMin="0.0" height="170" legend="false" xMax="20.0" yMin="0.0" width="275" xAxis="Time (years)" display="Number of forests">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="nb_forets" color="-16777216" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+    </plot>
+    <plot x="30" autoPlotX="true" yMax="10.0" autoPlotY="true" yAxis="Area (Ha)" y="620" xMin="0.0" height="170" legend="true" xMax="20.0" yMin="0.0" width="305" xAxis="Time (years) " display="Forest Sizes">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Median" color="-4079321" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Max" color="-12087248" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Min" color="-5298144" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+    </plot>
+    <plot x="345" autoPlotX="false" yMax="0.0" autoPlotY="true" y="620" xMin="0.0" height="170" legend="false" xMax="20.0" yMin="0.0" width="310" xAxis="Time (years)" display="Fragmentation index">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="indice_fragmentation" color="-16777216" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+    </plot>
+    <note x="90" y="100" backgroundDark="-1" fontSize="12" width="195" markdown="true" height="18" textColorDark="-16777216" textColorLight="-1" backgroundLight="-50397184">**ARTIFICIALIZATION EXTENSION**</note>
+    <plot x="955" autoPlotX="true" yMax="1.0" autoPlotY="true" yAxis="%" y="445" xMin="0.0" height="165" legend="true" xMax="20.0" yMin="0.0" width="505" xAxis="Time (years)" display="Variance">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="% of exploitation" color="-8431303" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="% of artificialization" color="-11053225" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="% of regeneration/colonisation" color="-10899396" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+    </plot>
+    <plot x="955" autoPlotX="true" yMax="5.0" autoPlotY="true" y="620" xMin="0.0" height="170" legend="true" xMax="20.0" yMin="0.0" width="500" xAxis="Time (years)" display="Number of degradation hotspots">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Diseases/Pest" color="-8630108" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Fire" color="-2674135" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+    </plot>
+  </widgets>
+  <info>## WHAT IS IT?
+
+This model simulates socio-environmental processes affecting forest landscapes. It combines natural and human-driven processes, including forest exploitation, artificialization, fires, and diseases, as well as forest regeneration. The model tracks the dynamics of forest cover, fragmentation, and degradation over time, allowing users to explore how interactions between human activities and natural events shape forest landscapes.
+
+## HOW IT WORKS
+
+The model represents a forest landscape divided into patches. Each patch can be intact forest, degraded forest, no-artificialized land, or artificialized. Every year (tick), the patches are updated according to the following rules:
+
+**Artificialization** : patches neighboring already artificialized areas are converted to urbanized land based on a defined expansion rate and priority of land type.
+
+**Exploitation** : intact forest patches can be degraded by human activities. Patches next to already degraded forest have a higher probability of being exploited than isolated patches.
+
+**Disease** : diseases affect random forest patches, spreading locally to neighboring patches with a probability.
+
+**Fire** : fire starts from random forest patches and spreads to neighboring forest patches with a defined probability.
+
+**Regeneration** : degraded patches can recover, either by regeneration of intact forest or by colonization from neighboring forest patches.
+
+The interactions between these rules create feedback loops: human activities reduce forest cover, which affects regeneration and future artificialization, while natural disturbances modify forest structure, influencing future vulnerability. This produces a dynamic, realistic evolution of the landscape over time.
+
+## HOW TO USE IT
+
+**Input Data** : Place the files foret.png and artificialise.png in the same folder as the NetLogo model. These files define the initial forest and urbanized areas.
+
+**Parameters** : Adjust the sliders, switches, and input boxes to set the rates for:
+
+Forest exploitation
+
+Artificialization
+
+Disease and fire
+
+Forest regeneration
+
+**Setup** : Click the Setup button to initialize the landscape based on the input files and parameter settings.
+
+**Go** Click the Go button to run the simulation. Each tick represents one year. Watch how forest, degraded areas, and artificialization land change over time.
+
+**Display Mode** : Choose Simple or More to change the visualization:
+
+*Simple* : basic colors for forest, degraded forest, artificialized, and no-artificialized land.
+
+*More* : degraded forest colors indicate the cause of degradation (exploitation, fire, disease).
+
+**Plots** : Observe the graphs to track surface areas, forest sizes, fragmentation, number of forests, and variance in processes.
+
+## THINGS TO NOTICE
+
+**Forest degradation patterns** : patches next to already degraded forest are more likely to be affected by exploitation.
+
+**Spread of fires and diseases** : notice how hotspots appear and propagate locally.
+
+**Regeneration** : observe how degraded patches recover over time and how colonization occurs from neighboring forests.
+
+**Artificialization** : artificialized areas expand mostly around existing urbanized patches.
+
+**Interaction effects** : how human activities and natural events combine to influence forest cover and landscape patterns.
+
+## THINGS TO TRY
+
+Move sliders to change exploitation, urbanization, disease, fire, or regeneration rates.
+Toggle display mode between Simple and More.
+Try different combinations of parameters and observe how the forest changes over time.
+
+## EXTENDING THE MODEL
+
+
+## NETLOGO FEATURES
+
+
+## RELATED MODELS
+
+
+## CREDITS AND REFERENCES
+
+Developed by Group3 M2 GAED/OTG 2025-2026.
+GitHub repository: https://github.com/lietheo/Group3_ForestDegradationSim
+ODD documentation: https://github.com/lietheo/Group3_ForestDegradationSim</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+</model>
